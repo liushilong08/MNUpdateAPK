@@ -1,6 +1,6 @@
 package com.maning.mnupdateapk;
 
-import android.content.Context;
+import android.app.Activity;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
@@ -15,7 +15,7 @@ public class OtherActivity extends AppCompatActivity {
     private TextView tv_progress;
     private TextView tv_info;
 
-    private Context context;
+    private Activity context;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {

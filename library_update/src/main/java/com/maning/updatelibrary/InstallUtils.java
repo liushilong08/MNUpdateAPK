@@ -5,50 +5,42 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Handler;
+import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Log;
 
+import com.maning.updatelibrary.http.AbsFileProgressCallback;
+import com.maning.updatelibrary.http.DownloadFileUtils;
+import com.maning.updatelibrary.utils.ActForResultCallback;
+import com.maning.updatelibrary.utils.ActResultRequest;
+import com.maning.updatelibrary.utils.MNUtils;
+
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.util.Timer;
-import java.util.TimerTask;
+
+import static android.app.Activity.RESULT_OK;
 
 /**
  * Created by maning on 16/8/15.
- * 下载更新APK的工具
+ * 安装APK的工具
  */
 public class InstallUtils {
 
-    private static final String TAG = "InstallUtils";
+    private static final String TAG = InstallUtils.class.getSimpleName();
     private static InstallUtils mInstance;
+    private static Context mContext;
 
-    //任务定时器
-    private Timer mTimer;
-    //定时任务
-    private TimerTask mTask;
-    //文件总大小
-    private int fileLength = 1;
-    //下载的文件大小
-    private int fileCurrentLength;
-
+    //------------------下载相关---------------------
     private String httpUrl;
-    private String savePath;
-    private String saveName;
-    private static File saveFile;
+    private String filePath;
+    private static DownloadCallBack mDownloadCallBack;
+    /**
+     * 是不是在正在下载
+     */
+    private static boolean isDownloading = false;
 
-    private static Context context;
-    private static Handler handler = new Handler();
-    private static DownloadCallBack downloadCallBack;
-    private static boolean isComplete = false;   //是不是完成下载
-    private static boolean isHttp302 = false;  //是不是302重定向
-    private static boolean isCancle = false;  //是不是手动取消
-
-
+    /**
+     * 下载回调监听
+     */
     public interface DownloadCallBack {
         void onStart();
 
@@ -61,16 +53,17 @@ public class InstallUtils {
         void cancle();
     }
 
-    public interface InstallCallBack {
-        void onSuccess();
-
-        void onFail(Exception e);
-    }
-
     /**
      * 私有构造函数
      */
     private InstallUtils() {
+    }
+
+    /**
+     * 是否正在下载
+     */
+    public static boolean isDownloading() {
+        return isDownloading;
     }
 
     /**
@@ -79,24 +72,12 @@ public class InstallUtils {
      * @param downloadCallBack
      */
     public static void setDownloadCallBack(DownloadCallBack downloadCallBack) {
-        InstallUtils.downloadCallBack = downloadCallBack;
+        //判断有没有开始
+        if (isDownloading) {
+            mDownloadCallBack = downloadCallBack;
+        }
     }
 
-    /**
-     * 取消下载
-     */
-    public static void cancleDownload() {
-        isCancle = true;
-    }
-
-    /**
-     * 是否完成下载操作
-     *
-     * @return
-     */
-    public static boolean isComplete() {
-        return isComplete;
-    }
 
     /**
      * 初始化对象
@@ -105,24 +86,10 @@ public class InstallUtils {
      * @return
      */
     public static InstallUtils with(Context context) {
-        InstallUtils.context = context;
+        mContext = context.getApplicationContext();
         if (mInstance == null) {
             mInstance = new InstallUtils();
         }
-        isCancle = false;
-        isComplete = false;
-        isHttp302 = false;
-        return mInstance;
-    }
-
-    /**
-     * 设置保存的名字
-     *
-     * @param apkName
-     * @return
-     */
-    public InstallUtils setApkName(String apkName) {
-        this.saveName = apkName;
         return mInstance;
     }
 
@@ -138,13 +105,13 @@ public class InstallUtils {
     }
 
     /**
-     * 设置下载后保存的地址
+     * 设置下载后保存的地址,带后缀
      *
      * @param apkPath
      * @return
      */
     public InstallUtils setApkPath(String apkPath) {
-        this.savePath = apkPath;
+        this.filePath = apkPath;
         return mInstance;
     }
 
@@ -155,7 +122,7 @@ public class InstallUtils {
      * @return
      */
     public InstallUtils setCallBack(DownloadCallBack downloadCallBack) {
-        InstallUtils.downloadCallBack = downloadCallBack;
+        mDownloadCallBack = downloadCallBack;
         return mInstance;
     }
 
@@ -163,225 +130,87 @@ public class InstallUtils {
      * 开始下载
      */
     public void startDownload() {
-        if (TextUtils.isEmpty(this.savePath)) {
-            this.savePath = MNUtils.getCachePath(this.context);
+        //先取消之前的下载
+        if (isDownloading) {
+            cancleDownload();
         }
-        if (TextUtils.isEmpty(this.saveName)) {
-            this.saveName = "update";
+        //判断下载保存路径是不是空
+        if (TextUtils.isEmpty(filePath)) {
+            filePath = MNUtils.getCachePath(mContext) + "/update.apk";
         }
-        try {
-            if (TextUtils.isEmpty(httpUrl)) {
-                downloadFail(new Exception("下载地址为空"));
-                return;
-            }
-            saveFile = new File(savePath);
-            if (!saveFile.exists()) {
-                boolean isMK = saveFile.mkdirs();
-                if (!isMK) {
-                    //创建失败
-                    downloadFail(new Exception("创建文件夹失败"));
-                    return;
-                }
-            }
-            if (saveFile.getAbsolutePath().endsWith("/")) {
-                saveFile = new File(savePath + saveName + ".apk");
-            } else {
-                saveFile = new File(savePath + File.separator + saveName + ".apk");
-            }
-            //开始下载
-            downloadStart();
-            //开启线程下载
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    InputStream inputStream = null;
-                    FileOutputStream outputStream = null;
-                    HttpURLConnection connection = null;
-                    try {
-                        URL url = new URL(httpUrl);
-                        connection = (HttpURLConnection) url.openConnection();
-                        connection.setConnectTimeout(30 * 1000);
-                        connection.setReadTimeout(30 * 1000);
-                        connection.connect();
+        //文件权限处理
+        MNUtils.changeApkFileMode(new File(filePath));
+        //下载
+        DownloadFileUtils.with()
+                .downloadPath(filePath)
+                .url(httpUrl)
+                .tag(InstallUtils.class)
+                .execute(new AbsFileProgressCallback() {
+                    int currentProgress = 0;
 
-                        //判断是不是成功
-                        int responseCode = connection.getResponseCode();
-                        //302重定向问题
-                        if (responseCode == 302) {
-                            String location = connection.getHeaderField("Location");
-                            downloadAlgin(location);
-                            return;
-                        }
-                        //失败了
-                        if (responseCode != 200) {
-                            //失败的地址
-                            final String responseMessage = connection.getResponseMessage();
-                            downloadFail(new Exception(responseMessage));
-                            return;
-                        }
-
-                        inputStream = connection.getInputStream();
-                        outputStream = new FileOutputStream(saveFile);
-                        fileLength = connection.getContentLength();
-
-                        //判断fileLength大小
-                        if (fileLength <= 0) {
-                            //失败
-                            downloadFail(new Exception("下载失败"));
-                            return;
-                        }
-
-                        //计时器
-                        initTimer();
-
-                        byte[] buffer = new byte[1024];
-                        int current = 0;
-                        int len;
-                        while (!isCancle && (len = inputStream.read(buffer)) > 0) {
-                            outputStream.write(buffer, 0, len);
-                            current += len;
-                            if (fileLength > 0) {
-                                fileCurrentLength = current;
-                            }
-                        }
-                        isComplete = true;
-                        if (isCancle) {
-                            //下载取消
-                            downloadCancle();
-                            return;
-                        }
-                        //延时通知下载完成
-                        Thread.sleep(500);
-                        //下载完成
-                        downloadComplete();
-                    } catch (final Exception e) {
-                        e.printStackTrace();
-                        downloadFail(e);
-                    } finally {
-                        try {
-                            if (inputStream != null)
-                                inputStream.close();
-                            if (outputStream != null)
-                                outputStream.close();
-                            if (connection != null)
-                                connection.disconnect();
-                        } catch (IOException e) {
-                        }
-                        //销毁Timer
-                        destroyTimer();
-                        isCancle = false;
-                        isHttp302 = false;
-                        fileLength = 1;
-                        fileCurrentLength = 0;
-                        handler.removeCallbacksAndMessages(null);
-                    }
-                }
-            }).start();
-
-        } catch (Exception e) {
-            downloadFail(new Exception("下载异常"));
-        }
-
-    }
-
-    private void downloadAlgin(final String newHttp) {
-        handler.post(new Runnable() {
-            @Override
-            public void run() {
-                isHttp302 = true;
-                httpUrl = newHttp;
-                startDownload();
-            }
-        });
-    }
-
-    private void downloadStart() {
-        if (isHttp302) {
-            return;
-        }
-        isHttp302 = false;
-        if (downloadCallBack != null) {
-            //下载开始
-            downloadCallBack.onStart();
-        }
-    }
-
-    private void downloadComplete() {
-        try {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (downloadCallBack != null) {
-                        downloadCallBack.onComplete(saveFile.getPath());
-                        downloadCallBack = null;
-                    }
-                }
-            });
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-    }
-
-    private void downloadFail(final Exception exception) {
-        try {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (downloadCallBack != null) {
-                        downloadCallBack.onFail(exception);
-                        downloadCallBack = null;
-                    }
-                }
-            });
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void downloadCancle() {
-        try {
-            handler.post(new Runnable() {
-                @Override
-                public void run() {
-                    if (downloadCallBack != null) {
-                        downloadCallBack.cancle();
-                        downloadCallBack = null;
-                    }
-                }
-            });
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void initTimer() {
-        mTimer = new Timer();
-        mTask = new TimerTask() {
-            @Override
-            public void run() {
-                handler.post(new Runnable() {
                     @Override
-                    public void run() {
-                        if (downloadCallBack != null && !isComplete) {
-                            downloadCallBack.onLoading(fileLength, fileCurrentLength);
+                    public void onSuccess(String result) {
+                        isDownloading = false;
+                        if (mDownloadCallBack != null) {
+                            mDownloadCallBack.onComplete(filePath);
+                        }
+                    }
+
+                    @Override
+                    public void onProgress(long bytesRead, long contentLength, boolean done) {
+                        isDownloading = true;
+                        if (mDownloadCallBack != null) {
+                            //计算进度
+                            int progress = (int) (bytesRead * 100 / contentLength);
+                            //只有进度+1才回调，防止过快
+                            if (progress - currentProgress >= 1) {
+                                mDownloadCallBack.onLoading(contentLength, bytesRead);
+                            }
+                            currentProgress = progress;
+                        }
+                    }
+
+                    @Override
+                    public void onFailed(String errorMsg) {
+                        isDownloading = false;
+                        if (mDownloadCallBack != null) {
+                            mDownloadCallBack.onFail(new Exception(errorMsg));
+                        }
+                    }
+
+                    @Override
+                    public void onStart() {
+                        isDownloading = true;
+                        if (mDownloadCallBack != null) {
+                            mDownloadCallBack.onStart();
+                        }
+                    }
+
+                    @Override
+                    public void onCancle() {
+                        isDownloading = false;
+                        if (mDownloadCallBack != null) {
+                            mDownloadCallBack.cancle();
                         }
                     }
                 });
-            }
-        };
-        mTimer.schedule(mTask, 0, 200);
     }
 
-
-    private void destroyTimer() {
-        if (mTimer != null && mTask != null) {
-            mTask.cancel();
-            mTimer.cancel();
-            mTask = null;
-            mTimer = null;
-        }
+    public static void cancleDownload() {
+        DownloadFileUtils.cancle(InstallUtils.class);
     }
+
+    //------------------安装相关---------------------
+
+    /**
+     * 安装回调监听
+     */
+    public interface InstallCallBack {
+        void onSuccess();
+
+        void onFail(Exception e);
+    }
+
 
     /**
      * 安装APK工具类
@@ -390,8 +219,9 @@ public class InstallUtils {
      * @param filePath 文件路径
      * @param callBack 安装界面成功调起的回调
      */
-    public static void installAPK(Context context, String filePath, InstallCallBack callBack) {
+    public static void installAPK(Activity context, String filePath, final InstallCallBack callBack) {
         try {
+            MNUtils.changeApkFileMode(new File(filePath));
             Intent intent = new Intent();
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             intent.setAction(Intent.ACTION_VIEW);
@@ -406,10 +236,17 @@ public class InstallUtils {
                 apkUri = Uri.fromFile(apkFile);
             }
             intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
-            context.startActivity(intent);
-            if (callBack != null) {
-                callBack.onSuccess();
-            }
+            new ActResultRequest(context).startForResult(intent, new ActForResultCallback() {
+                @Override
+                public void onActivityResult(int resultCode, Intent data) {
+                    Log.i(TAG, "onActivityResult:" + resultCode);
+                    //调起了系统安装页面
+                    if (callBack != null) {
+                        callBack.onSuccess();
+                    }
+                }
+            });
+
         } catch (Exception e) {
             if (callBack != null) {
                 callBack.onFail(e);
@@ -428,5 +265,81 @@ public class InstallUtils {
         Intent viewIntent = new Intent(Intent.ACTION_VIEW, uri);
         context.startActivity(viewIntent);
     }
+
+
+    /**
+     * 8.0权限检查回调监听
+     */
+    public interface InstallPermissionCallBack {
+        void onGranted();
+
+        void onDenied();
+    }
+
+
+    /**
+     * 检查有没有安装权限
+     * @param activity
+     * @param installPermissionCallBack
+     */
+    public static void checkInstallPermission(Activity activity, InstallPermissionCallBack installPermissionCallBack) {
+        if (hasInstallPermission(activity)) {
+            if (installPermissionCallBack != null) {
+                installPermissionCallBack.onGranted();
+            }
+        } else {
+            openInstallPermissionSetting(activity, installPermissionCallBack);
+        }
+    }
+
+
+    /**
+     * 判断有没有安装权限
+     * @param context
+     * @return
+     */
+    public static boolean hasInstallPermission(Context context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            //先获取是否有安装未知来源应用的权限
+            return context.getPackageManager().canRequestPackageInstalls();
+        }
+        return true;
+    }
+
+    /**
+     * 去打开安装权限的页面
+     * @param activity
+     * @param installPermissionCallBack
+     */
+    public static void openInstallPermissionSetting(Activity activity, final InstallPermissionCallBack installPermissionCallBack) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Uri packageURI = Uri.parse("package:" + activity.getPackageName());
+            Intent intent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, packageURI);
+            new ActResultRequest(activity).startForResult(intent, new ActForResultCallback() {
+                @Override
+                public void onActivityResult(int resultCode, Intent data) {
+                    Log.i(TAG, "onActivityResult:" + resultCode);
+                    if (resultCode == RESULT_OK) {
+                        //用户授权了
+                        if (installPermissionCallBack != null) {
+                            installPermissionCallBack.onGranted();
+                        }
+                    } else {
+                        //用户没有授权
+                        if (installPermissionCallBack != null) {
+                            installPermissionCallBack.onDenied();
+                        }
+                    }
+                }
+            });
+        } else {
+            //用户授权了
+            if (installPermissionCallBack != null) {
+                installPermissionCallBack.onGranted();
+            }
+        }
+
+    }
+
 
 }
